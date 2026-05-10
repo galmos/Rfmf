@@ -34,6 +34,19 @@ TEMPORADA_DEFAULT   = "21"
 TIPO_JUEGO          = "1"          # Fútbol 11
 GRUPO_7_ID          = "24037715"   # Grupo 7
 
+# IDs de los 8 grupos. Patrón: competicion_id + número_de_grupo.
+# Verificar si alguno no carga e indicar el ID real con --grupo-ids.
+GRUPOS_TODOS = [
+    {"id": "24037709", "nombre": "Grupo 1"},
+    {"id": "24037710", "nombre": "Grupo 2"},
+    {"id": "24037711", "nombre": "Grupo 3"},
+    {"id": "24037712", "nombre": "Grupo 4"},
+    {"id": "24037713", "nombre": "Grupo 5"},
+    {"id": "24037714", "nombre": "Grupo 6"},
+    {"id": "24037715", "nombre": "Grupo 7"},
+    {"id": "24037716", "nombre": "Grupo 8"},
+]
+
 # Reglas de descenso
 DESCENSO_DIRECTO_N    = 3  # últimas N posiciones de grupos de 14 → descenso directo
 DESCENSO_COEF_N       = 4  # de entre todos los 11ºs, los N con peor coef. descienden
@@ -91,37 +104,40 @@ def discover_groups(
     session: requests.Session,
     temporada: str,
     competicion: str,
+    grupo_ids_override: Optional[list[str]] = None,
 ) -> list[dict]:
     """
-    Descarga la página de clasificaciones sin grupo específico y extrae
-    todos los IDs de grupo disponibles (de atributos href/value).
+    Devuelve los grupos de la competición.
+    Primero usa grupo_ids_override si se proporcionan; si no, intenta
+    extraer los IDs del HTML; como fallback usa GRUPOS_TODOS.
     """
+    if grupo_ids_override:
+        return [{"id": gid, "nombre": f"Grupo {i+1}"} for i, gid in enumerate(grupo_ids_override)]
+
     soup = fetch_soup(session, "/competicion/clasificaciones", {
         "temporada": temporada,
         "competicion": competicion,
         "tipojuego": TIPO_JUEGO,
     })
-    if not soup:
-        return []
+    if soup:
+        seen: set[str] = set()
+        groups: list[dict] = []
+        for tag in soup.find_all(["option", "a"]):
+            href  = tag.get("href", "") or ""
+            value = tag.get("value", "") or ""
+            label = tag.get_text(strip=True)
+            for src in [href, value]:
+                if "grupo=" not in src:
+                    continue
+                gid = src.split("grupo=")[1].split("&")[0].split("#")[0].strip()
+                if gid and gid not in seen:
+                    seen.add(gid)
+                    groups.append({"id": gid, "nombre": label or gid})
+        if groups:
+            return groups
 
-    seen: set[str] = set()
-    groups: list[dict] = []
-
-    # Busca en <select> con name="grupo" y en <a href="...grupo=X...">
-    for tag in soup.find_all(["option", "a"]):
-        href  = tag.get("href", "") or ""
-        value = tag.get("value", "") or ""
-        label = tag.get_text(strip=True)
-
-        for src in [href, value]:
-            if "grupo=" not in src:
-                continue
-            gid = src.split("grupo=")[1].split("&")[0].split("#")[0].strip()
-            if gid and gid not in seen:
-                seen.add(gid)
-                groups.append({"id": gid, "nombre": label or gid})
-
-    return groups
+    # Fallback: IDs hardcodeados para la competición 24037708 (8 grupos)
+    return list(GRUPOS_TODOS)
 
 
 def discover_latest_jornada(
@@ -659,6 +675,41 @@ def print_relegation_analysis(analysis: dict, n_grupos: int) -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# BÚSQUEDA DE EQUIPO ENTRE GRUPOS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def find_team_group(
+    all_standings: dict[str, list[dict]],
+    nombre_parcial: str,
+) -> tuple[Optional[str], Optional[dict]]:
+    """
+    Busca un equipo por nombre parcial (insensible a mayúsculas) en todos
+    los grupos descargados.
+    Devuelve (grupo_id, equipo_dict) o (None, None) si no se encuentra.
+    """
+    needle = nombre_parcial.lower()
+    matches = []
+    for gid, teams in all_standings.items():
+        for t in teams:
+            if needle in t["nombre"].lower():
+                matches.append((gid, t))
+
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        # Preferir coincidencia exacta si existe
+        exact = [(g, t) for g, t in matches if t["nombre"].lower() == needle]
+        if exact:
+            return exact[0]
+        print(f"  ⚠ Varios equipos coinciden con '{nombre_parcial}':")
+        for g, t in matches:
+            print(f"     [{g}] {t['nombre']}")
+        return matches[0]   # Devuelve el primero; el usuario puede afinar
+
+    return None, None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # CARGA / GUARDADO DE CACHÉ
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -689,18 +740,31 @@ def parse_args() -> argparse.Namespace:
         description=(
             "Clasificaciones RFFM — Preferente Alevín F11\n"
             "Descarga clasificación, analiza descenso y simula escenarios.\n\n"
-            "Ejemplo:\n"
-            "  python rffm_clasificacion.py -e 'Atlético Madrid B' --todos-grupos\n"
+            "Ejemplos:\n"
+            "  # Todos los grupos + simular equipo 'Ivero':\n"
+            "  python rffm_clasificacion.py --todos-grupos -e Ivero\n\n"
+            "  # Con caché (no re-descarga):\n"
+            "  python rffm_clasificacion.py --todos-grupos -e Ivero --cache\n\n"
+            "  # Con IDs de grupo explícitos si el autodetect falla:\n"
+            "  python rffm_clasificacion.py --todos-grupos -e Ivero "
+            "--grupo-ids 24037709,24037710,...,24037716\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument(
         "--equipo", "-e", default="",
-        help="Nombre (parcial) del equipo a simular.",
+        help="Nombre (parcial) del equipo a simular. Busca en todos los grupos descargados.",
     )
     p.add_argument(
         "--grupo", "-g", default=GRUPO_7_ID,
-        help=f"ID del grupo objetivo (default: {GRUPO_7_ID} = Grupo 7).",
+        help=f"ID del grupo a mostrar en detalle (default: {GRUPO_7_ID} = Grupo 7).",
+    )
+    p.add_argument(
+        "--grupo-ids", default="",
+        help=(
+            "IDs de grupo separados por coma para --todos-grupos. "
+            "Si se omite, usa los IDs hardcodeados (24037709-24037716)."
+        ),
     )
     p.add_argument(
         "--competicion", "-c", default=COMPETICION_DEFAULT,
@@ -712,11 +776,11 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--total-jornadas", "-j", type=int, default=0,
-        help="Total de jornadas de la competición (0 = autodetectar).",
+        help="Total de jornadas de la competición (0 = autodetectar, 26 para grupos de 14).",
     )
     p.add_argument(
         "--todos-grupos", action="store_true",
-        help="Descarga clasificaciones de todos los grupos (necesario para coef. cruzado).",
+        help="Descarga los 8 grupos (necesario para análisis de coef. cruzado y buscar equipo).",
     )
     p.add_argument(
         "--cache", action="store_true",
@@ -757,27 +821,31 @@ def main() -> None:
     if args.cache:
         cached = load_cache(cache_file)
         if cached:
-            all_standings   = cached.get("standings", {})
-            latest_jornada  = cached.get("jornada", 0)
+            all_standings  = cached.get("standings", {})
+            latest_jornada = cached.get("jornada", 0)
             print(f"\n📂 Datos cargados desde caché (Jornada {latest_jornada})")
 
     # ── Descarga online ──────────────────────────────────────────────────────
     if not all_standings:
-        # Grupos a descargar
-        if args.todos_grupos:
-            print(f"\n🔍 Buscando grupos de la competición...")
-            groups = discover_groups(session, args.temporada, args.competicion)
-            if not groups:
-                print("  ⚠ No se encontraron grupos. Usando solo el grupo especificado.")
-                groups = [{"id": args.grupo, "nombre": "Grupo 7"}]
-            # Asegura que el grupo objetivo está incluido
+        # IDs de grupo explícitos por CLI (--grupo-ids 24037709,24037710,...)
+        grupo_ids_override = (
+            [x.strip() for x in args.grupo_ids.split(",") if x.strip()]
+            if args.grupo_ids else None
+        )
+
+        if args.todos_grupos or args.grupo_ids:
+            print(f"\n🔍 Preparando grupos de la competición...")
+            groups = discover_groups(
+                session, args.temporada, args.competicion, grupo_ids_override
+            )
+            # Asegura que el grupo "objetivo" (--grupo) esté incluido
             if not any(g["id"] == args.grupo for g in groups):
                 groups.append({"id": args.grupo, "nombre": "Grupo 7"})
-            print(f"  Grupos encontrados: {len(groups)}")
+            print(f"  Grupos a descargar: {len(groups)}")
         else:
             groups = [{"id": args.grupo, "nombre": "Grupo objetivo"}]
 
-        # Última jornada
+        # Última jornada (se determina sobre el grupo objetivo)
         print(f"\n📅 Buscando última jornada disputada...")
         latest_jornada = discover_latest_jornada(
             session, args.temporada, args.competicion, args.grupo
@@ -811,63 +879,94 @@ def main() -> None:
         print("\n❌ No se pudieron obtener datos. Comprueba la conexión y los parámetros.")
         sys.exit(1)
 
-    # Total de jornadas y jornadas restantes
+    # ── Localizar el equipo objetivo (y su grupo) ────────────────────────────
+    equipo_nombre = args.equipo
+    grupo_id_equipo = args.grupo   # grupo donde está el equipo; se autodetecta si se busca
+
+    if equipo_nombre:
+        found_gid, found_team = find_team_group(all_standings, equipo_nombre)
+        if found_team:
+            grupo_id_equipo = found_gid
+            equipo_nombre   = found_team["nombre"]   # nombre exacto
+            if found_gid != args.grupo:
+                print(
+                    f"\n  🔎 '{equipo_nombre}' encontrado en grupo {found_gid} "
+                    f"(no en el grupo por defecto {args.grupo})"
+                )
+        else:
+            print(f"\n  ⚠ No se encontró el equipo '{equipo_nombre}' en los datos descargados.")
+            if not (args.todos_grupos or args.grupo_ids):
+                print("     Prueba con --todos-grupos para buscar en los 8 grupos.")
+
+    # ── Total jornadas / restantes ────────────────────────────────────────────
     if args.total_jornadas > 0:
         total_jornadas = args.total_jornadas
     else:
-        # Para grupos de 14: (14-1)*2 = 26 jornadas
-        grupo_teams = all_standings.get(args.grupo, [])
-        n = len(grupo_teams) if grupo_teams else GRUPO_SIZE_STANDARD
+        ref_teams = all_standings.get(grupo_id_equipo, [])
+        n = len(ref_teams) if ref_teams else GRUPO_SIZE_STANDARD
         total_jornadas = (n - 1) * 2
         print(f"\n  ℹ Total jornadas estimado: {total_jornadas} (grupos de {n} equipos)")
 
     remaining = max(0, total_jornadas - latest_jornada)
 
-    # ── Clasificación del grupo objetivo ────────────────────────────────────
-    grupo_teams = all_standings.get(args.grupo, [])
+    # ── Clasificación del grupo del equipo objetivo ───────────────────────────
+    grupo_teams = all_standings.get(grupo_id_equipo, [])
+    grupo_nombre_display = next(
+        (g["nombre"] for g in GRUPOS_TODOS if g["id"] == grupo_id_equipo),
+        f"Grupo {grupo_id_equipo}",
+    )
     if grupo_teams:
         print_standings_table(
             grupo_teams,
-            f"CLASIFICACIÓN GRUPO 7 — PREFERENTE ALEVÍN — Jornada {latest_jornada} "
-            f"({remaining} jornada(s) restante(s))",
-            highlight=args.equipo,
+            f"CLASIFICACIÓN {grupo_nombre_display.upper()} — PREFERENTE ALEVÍN "
+            f"— Jornada {latest_jornada} ({remaining} jornada(s) restante(s))",
+            highlight=equipo_nombre,
         )
     else:
-        print(f"\n  ⚠ No hay datos para el grupo {args.grupo}")
+        print(f"\n  ⚠ No hay datos para el grupo {grupo_id_equipo}")
 
-    # ── Análisis de descenso ─────────────────────────────────────────────────
+    # ── Si se descargaron todos los grupos, muestra la tabla completa ─────────
+    if len(all_standings) > 1 and grupo_id_equipo != args.grupo:
+        grupo_7_teams = all_standings.get(args.grupo, [])
+        if grupo_7_teams:
+            print_standings_table(
+                grupo_7_teams,
+                f"CLASIFICACIÓN GRUPO 7 — PREFERENTE ALEVÍN — Jornada {latest_jornada}",
+            )
+
+    # ── Análisis de descenso ──────────────────────────────────────────────────
     analysis = build_relegation_analysis(all_standings)
     print_relegation_analysis(analysis, len(all_standings))
 
     # ── Calendario (opcional) ─────────────────────────────────────────────────
     fixtures: dict[int, list[dict]] = {}
     if args.con_calendario and remaining > 0:
-        print(f"\n📆 Descargando calendario pendiente...")
+        print(f"\n📆 Descargando calendario pendiente ({grupo_nombre_display})...")
         fixtures = fetch_remaining_fixtures(
-            session, args.temporada, args.competicion, args.grupo, latest_jornada
+            session, args.temporada, args.competicion, grupo_id_equipo, latest_jornada
         )
         if fixtures:
-            print(f"  ✓ {sum(len(v) for v in fixtures.values())} partidos pendientes encontrados")
+            print(f"  ✓ {sum(len(v) for v in fixtures.values())} partidos encontrados")
         else:
             print("  ⚠ No se pudo obtener el calendario")
 
-    # ── Simulación para equipo concreto ──────────────────────────────────────
-    if args.equipo and grupo_teams and remaining > 0:
+    # ── Simulación para equipo concreto ───────────────────────────────────────
+    if equipo_nombre and grupo_teams and remaining > 0:
         simulate(
             grupo_teams,
-            args.equipo,
+            equipo_nombre,
             remaining,
             all_standings,
-            args.grupo,
+            grupo_id_equipo,
             fixtures=fixtures if fixtures else None,
             latest_jornada=latest_jornada,
         )
-    elif args.equipo and remaining == 0:
+    elif equipo_nombre and remaining == 0:
         print(f"\n  ℹ La competición ha finalizado. No quedan jornadas para simular.")
-    elif not args.equipo:
+    elif not equipo_nombre:
         print(
-            f"\n  ℹ Usa --equipo \"Nombre\" para ver la simulación de escenarios "
-            f"del equipo deseado."
+            f"\n  ℹ Usa --equipo \"Nombre\" para ver la simulación de escenarios. "
+            f"Con --todos-grupos busca en los 8 grupos automáticamente."
         )
 
 
