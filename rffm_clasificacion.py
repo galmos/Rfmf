@@ -519,17 +519,32 @@ def print_relegation_analysis(analysis: dict, n_grupos: int) -> None:
         print(f"\n  ℹ  Para análisis de coeficiente usa --todos-grupos")
 
 
+def _short_name(nombre: str, maxlen: int = 22) -> str:
+    """Devuelve un nombre corto legible: acumula palabras hasta maxlen caracteres."""
+    if len(nombre) <= maxlen:
+        return nombre
+    words = nombre.split()
+    short = words[0]
+    for w in words[1:]:
+        candidate = short + " " + w
+        if len(candidate) <= maxlen:
+            short = candidate
+        else:
+            break
+    return short
+
+
 def _fmt_match_outcome(local: str, vis: str, result: str) -> str:
-    short_local = local.split()[0] if len(local) > 20 else local
-    short_vis   = vis.split()[0]   if len(vis) > 20   else vis
-    lbl = {"G": f"gana {short_local}", "E": f"empatan", "D": f"gana {short_vis}"}
+    sl = _short_name(local)
+    sv = _short_name(vis)
+    lbl = {"G": f"gana {sl}", "E": f"empatan", "D": f"gana {sv}"}
     return lbl[result]
 
 
 def _fmt_condition(local: str, vis: str, allowed: set) -> str:
     """Formatea una condición mínima como texto legible."""
-    sl = local.split()[0] if len(local) > 20 else local
-    sv = vis.split()[0] if len(vis) > 20 else vis
+    sl = _short_name(local)
+    sv = _short_name(vis)
     if allowed == {"G"}:
         return f"gana {sl}"
     if allowed == {"D"}:
@@ -616,7 +631,7 @@ def print_survival_report(
         total       = n_safe_pos + n_coef + n_rel
 
         print(f"\n  {'─'*73}")
-        print(f"  {results_emoji[tr]} SI {target_nombre.split()[0].upper()} "
+        print(f"  {results_emoji[tr]} SI {_short_name(target_nombre).upper()} "
               f"{results_label[tr]}:")
 
         if not rdata["can_survive"]:
@@ -649,7 +664,7 @@ def print_survival_report(
             my_c = best_coef["my_coef"]
             wi   = best_coef["worse_info"]
 
-            print(f"        Coeficiente de {target_nombre.split()[0]}: {my_c:.3f}")
+            print(f"        Coeficiente de {_short_name(target_nombre)}: {my_c:.3f}")
             other_matches_in_group = [m for m in flat if m != target_match]
             min_conds = find_minimum_conditions(rdata["coef_zone"], other_matches_in_group)
             if min_conds:
@@ -729,13 +744,13 @@ def print_survival_report(
     if rdata["safe_pos"]:
         best = min(rdata["safe_pos"], key=lambda s: s["position"])
         print(f"\n  ✅ MEJOR CAMINO — Permanencia POR POSICIÓN:")
-        print(f"     1. {target_nombre.split()[0]} debe {result_texts[min_result_needed].lower()} "
+        print(f"     1. {_short_name(target_nombre)} debe {result_texts[min_result_needed].lower()} "
               f"su partido")
         if best["match_outcomes"]:
             print(f"     2. En el resto del grupo:")
             for (local, vis), result in best["match_outcomes"].items():
                 print(f"        • {_fmt_match_outcome(local, vis, result)}")
-        print(f"     → {target_nombre.split()[0]} terminaría en posición "
+        print(f"     → {_short_name(target_nombre)} terminaría en posición "
               f"{best['position']}ª ✅")
 
     # ¿Puede sobrevivir por coeficiente?
@@ -748,7 +763,7 @@ def print_survival_report(
         always_b   = [v for v in wi.values() if not v["possible"]]
 
         print(f"\n  ⚠️  CAMINO ALTERNATIVO — Permanencia POR COEFICIENTE:")
-        print(f"     1. {target_nombre.split()[0]} debe {result_texts[min_result_needed].lower()} "
+        print(f"     1. {_short_name(target_nombre)} debe {result_texts[min_result_needed].lower()} "
               f"→ coef: {my_c:.3f}")
         if best_coef["match_outcomes"]:
             print(f"     2. En el resto del grupo:")
