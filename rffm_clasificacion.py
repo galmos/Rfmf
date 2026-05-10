@@ -535,16 +535,14 @@ def _short_name(nombre: str, maxlen: int = 22) -> str:
 
 
 def _fmt_match_outcome(local: str, vis: str, result: str) -> str:
-    sl = _short_name(local)
-    sv = _short_name(vis)
-    lbl = {"G": f"gana {sl}", "E": f"empatan", "D": f"gana {sv}"}
+    lbl = {"G": f"gana {local}", "E": f"empatan", "D": f"gana {vis}"}
     return lbl[result]
 
 
 def _fmt_condition(local: str, vis: str, allowed: set) -> str:
     """Formatea una condición mínima como texto legible."""
-    sl = _short_name(local)
-    sv = _short_name(vis)
+    sl = local
+    sv = vis
     if allowed == {"G"}:
         return f"gana {sl}"
     if allowed == {"D"}:
@@ -765,10 +763,14 @@ def print_survival_report(
         print(f"\n  ⚠️  CAMINO ALTERNATIVO — Permanencia POR COEFICIENTE:")
         print(f"     1. {_short_name(target_nombre)} debe {result_texts[min_result_needed].lower()} "
               f"→ coef: {my_c:.3f}")
-        if best_coef["match_outcomes"]:
-            print(f"     2. En el resto del grupo:")
-            for (local, vis), result in best_coef["match_outcomes"].items():
-                print(f"        • {_fmt_match_outcome(local, vis, result)}")
+        other_matches_sum = [m for m in flat if m != target_match]
+        min_conds_sum = find_minimum_conditions(rdata["coef_zone"], other_matches_sum)
+        if min_conds_sum:
+            print(f"     2. Condición(es) necesaria(s) en el grupo:")
+            for (local, vis), allowed in min_conds_sum.items():
+                print(f"        • {_fmt_condition(local, vis, allowed)}")
+        else:
+            print(f"     2. Sin condiciones adicionales en el grupo.")
 
         if always_w:
             print(f"     3. Grupos ya asegurados (undécimo siempre peor):")
