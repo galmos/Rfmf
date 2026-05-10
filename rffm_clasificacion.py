@@ -2,24 +2,25 @@
 """
 Clasificaciones RFFM — Preferente Alevín Fútbol 11
 Descarga la clasificación, analiza el descenso por coeficiente y simula
-escenarios de permanencia para un equipo concreto.
+escenarios de permanencia/ascenso para un equipo concreto.
 
 Normativa de descenso (Bases de Ascensos y Descensos RFFM F11):
   - Grupos de 14 equipos: descienden los 3 últimos (puestos 12, 13, 14).
   - Puesto 11 de cada grupo: se comparan por coeficiente (Pts / PJ).
     Los 4 equipos undécimos con peor coeficiente también descienden.
-    Ref: https://www.rffm.es/federacion-rffm/documentacion-y-circulares/normativa-y-reglamentos
 
 API RFFM:
-  - Grupos:   GET /api/groups?competicion={id}
-  - Jornadas: GET /api/group-rounds?idGroup={id}&fetchBy=standings
-  - Clasif.:  GET /api/standings?idGroup={id}&round={n}
+  - Grupos:    GET /api/groups?competicion={id}
+  - Jornadas:  GET /api/group-rounds?idGroup={id}&fetchBy=standings
+  - Clasif.:   GET /api/standings?idGroup={id}&round={n}
+  - Partidos:  GET /api/results?idGroup={id}&round={n}
 """
 
 import sys
 import json
 import time
 import argparse
+from copy import deepcopy
 from itertools import product
 from pathlib import Path
 from typing import Optional
@@ -37,19 +38,17 @@ GRUPO_7_ID          = "24037715"   # Grupo 7 (por defecto)
 
 DESCENSO_DIRECTO_N = 3   # últimas N posiciones → descenso directo
 DESCENSO_COEF_N    = 4   # de los undécimos, los N con peor coef descienden
+ASCENSO_N          = 2   # top N posiciones → ascenso
 
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     ),
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "es-ES,es;q=0.9",
     "Referer": "https://www.rffm.es/",
 }
-
-RESULT_PTS = {"G": 3, "E": 1, "D": 0}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -86,20 +85,12 @@ def fetch_json(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# DESCUBRIMIENTO: GRUPOS Y JORNADA
+# DESCUBRIMIENTO
 # ══════════════════════════════════════════════════════════════════════════════
 
-def discover_groups(
-    session: requests.Session,
-    competicion: str,
-) -> list[dict]:
-    """
-    Devuelve los grupos de la competición desde /api/groups.
-    Cada elemento: {id, nombre, total_jornadas, total_equipos}
-    """
+def discover_groups(session: requests.Session, competicion: str) -> list[dict]:
     data = fetch_json(session, "/api/groups", {"competicion": competicion})
     if not data or not isinstance(data, list):
-        print(f"  ⚠ No se pudieron obtener los grupos de {competicion}", file=sys.stderr)
         return []
     return [
         {
@@ -113,17 +104,9 @@ def discover_groups(
     ]
 
 
-def discover_current_round(
-    session: requests.Session,
-    grupo_id: str,
-) -> int:
-    """
-    Obtiene la jornada actual del grupo desde /api/group-rounds.
-    Devuelve currentRound; si no, el máximo codjornada disponible.
-    """
+def discover_current_round(session: requests.Session, grupo_id: str) -> int:
     data = fetch_json(session, "/api/group-rounds", {
-        "idGroup": grupo_id,
-        "fetchBy": "standings",
+        "idGroup": grupo_id, "fetchBy": "standings",
     })
     if data and isinstance(data, dict):
         if data.get("currentRound"):
@@ -131,25 +114,50 @@ def discover_current_round(
         jornadas = data.get("jornadas", [])
         if jornadas:
             return max(int(j["codjornada"]) for j in jornadas)
-    print(f"  ⚠ No se pudo obtener la jornada actual del grupo {grupo_id}", file=sys.stderr)
     return 1
 
 
+def fetch_round_fixtures(session: requests.Session, grupo_id: str, round_num: int) -> list[dict]:
+    """Devuelve los partidos NO jugados de una jornada concreta."""
+    data = fetch_json(session, "/api/results", {"idGroup": grupo_id, "round": round_num})
+    if not data or "partidos" not in data:
+        return []
+    return [
+        {
+            "local":     p["Nombre_equipo_local"],
+            "visitante": p["Nombre_equipo_visitante"],
+            "fecha":     p.get("fecha", ""),
+            "hora":      p.get("hora", ""),
+        }
+        for p in data["partidos"]
+        if p.get("Goles_casa", "") == "" and p.get("Retirado_local", "0") == "0"
+    ]
+
+
+def get_remaining_fixtures(
+    session: requests.Session,
+    grupo_id: str,
+    current_round: int,
+    total_rounds: int,
+) -> dict[int, list[dict]]:
+    """Retorna {jornada: [partidos]} para todas las jornadas pendientes."""
+    remaining: dict[int, list[dict]] = {}
+    for r in range(current_round + 1, total_rounds + 1):
+        fixtures = fetch_round_fixtures(session, grupo_id, r)
+        if fixtures:
+            remaining[r] = fixtures
+        time.sleep(0.2)
+    return remaining
+
+
 # ══════════════════════════════════════════════════════════════════════════════
-# PARSEO DE CLASIFICACIÓN (JSON)
+# PARSEO DE CLASIFICACIÓN
 # ══════════════════════════════════════════════════════════════════════════════
 
 def parse_standings(data: Optional[dict]) -> list[dict]:
-    """
-    Convierte la respuesta de /api/standings al formato interno:
-    {pos, nombre, pj, pg, pe, pp, gf, gc, dg, pts}
-    """
     if not data or not isinstance(data, dict):
         return []
     clasificacion = data.get("clasificacion", [])
-    if not clasificacion:
-        return []
-
     teams = []
     for t in clasificacion:
         try:
@@ -169,205 +177,297 @@ def parse_standings(data: Optional[dict]) -> list[dict]:
             })
         except (KeyError, ValueError):
             continue
-
     teams.sort(key=lambda t: t["pos"])
     return teams
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# COEFICIENTE
+# MOTOR DE SIMULACIÓN
 # ══════════════════════════════════════════════════════════════════════════════
 
 def coef(pts: int, pj: int) -> float:
     return pts / pj if pj > 0 else 0.0
 
 
+def apply_result(d: dict, local: str, visitante: str, result: str) -> None:
+    """Aplica G/E/D (perspectiva local) sobre el dict de clasificación."""
+    l, v = d.get(local), d.get(visitante)
+    if not l or not v:
+        return
+    l["pj"] += 1; v["pj"] += 1
+    if result == "G":
+        l["pts"] += 3; l["pg"] += 1; v["pp"] += 1
+    elif result == "E":
+        l["pts"] += 1; l["pe"] += 1; v["pts"] += 1; v["pe"] += 1
+    else:
+        v["pts"] += 3; v["pg"] += 1; l["pp"] += 1
+
+
+def sort_final(d: dict) -> list[dict]:
+    """Ordena el dict de clasificación: pts desc, coef desc, dg desc, gf desc, nombre asc."""
+    teams = sorted(
+        d.values(),
+        key=lambda t: (-t["pts"], -coef(t["pts"], t["pj"]), -t["dg"], -t["gf"], t["nombre"])
+    )
+    for i, t in enumerate(teams):
+        t["pos"] = i + 1
+    return teams
+
+
+def team_data(standings: list[dict], nombre: str) -> Optional[dict]:
+    """Busca un equipo por nombre parcial en la clasificación final."""
+    n = nombre.lower()
+    for t in standings:
+        if n in t["nombre"].lower() or t["nombre"].lower() in n:
+            return t
+    return None
+
+
+def flatten_fixtures(fixtures_by_round: dict[int, list[dict]]) -> list[tuple]:
+    """Convierte {jornada: [partidos]} a lista de (local, visitante, jornada)."""
+    return [
+        (m["local"], m["visitante"], rnd)
+        for rnd, matches in sorted(fixtures_by_round.items())
+        for m in matches
+    ]
+
+
+def run_scenarios(
+    teams: list[dict],
+    flat_matches: list[tuple],
+) -> list[tuple]:
+    """
+    Enumera todos los 3^n escenarios.
+    Retorna lista de (combo_tuple, final_standings_list).
+    """
+    n = len(flat_matches)
+    results = []
+    for combo in product(("G", "E", "D"), repeat=n):
+        d = {t["nombre"]: dict(t) for t in teams}
+        for i, (local, vis, _) in enumerate(flat_matches):
+            apply_result(d, local, vis, combo[i])
+        results.append((combo, sort_final(d)))
+    return results
+
+
 # ══════════════════════════════════════════════════════════════════════════════
-# ANÁLISIS DE DESCENSO
+# ANÁLISIS DE SUPERVIVENCIA
 # ══════════════════════════════════════════════════════════════════════════════
 
-def build_relegation_analysis(all_standings: dict[str, list[dict]]) -> dict:
-    direct: list[dict] = []
-    eleventh: list[dict] = []
+def find_target_match(flat_matches: list[tuple], target_nombre: str) -> Optional[tuple]:
+    """Localiza el partido del equipo objetivo."""
+    n = target_nombre.lower()
+    for m in flat_matches:
+        local, vis, _ = m
+        if n in local.lower() or n in vis.lower():
+            return m
+    return None
 
-    for gid, teams in all_standings.items():
-        n = len(teams)
-        for t in teams[n - DESCENSO_DIRECTO_N:]:
-            direct.append({**t, "grupo": gid})
-        if n >= 11:
-            t11 = teams[10]
-            eleventh.append({
-                **t11,
-                "grupo": gid,
-                "coef": coef(t11["pts"], t11["pj"]),
-            })
 
-    eleventh.sort(key=lambda x: x["coef"])
+def find_minimum_conditions(
+    scenarios: list[dict],
+    matches: list[tuple],
+) -> dict[tuple, set]:
+    """
+    Retorna las condiciones mínimas necesarias en todos los escenarios de supervivencia.
+    Solo incluye partidos donde no aparecen los 3 resultados posibles.
+    """
+    result: dict[tuple, set] = {}
+    for local, vis, _ in matches:
+        key = (local, vis)
+        seen: set[str] = set()
+        for s in scenarios:
+            if key in s.get("match_outcomes", {}):
+                seen.add(s["match_outcomes"][key])
+        if 0 < len(seen) < 3:
+            result[key] = seen
+    return result
+
+
+def analyze_survival(
+    target_nombre: str,
+    target_teams: list[dict],
+    target_fixtures: dict[int, list[dict]],
+    other_groups: dict[str, dict],  # {gid: {nombre, teams, fixtures}}
+) -> dict:
+    """
+    Análisis completo de supervivencia/ascenso para el equipo objetivo.
+
+    Retorna:
+    {
+      n_teams, safe_pos, ascenso_pos,
+      target_match,             # partido del equipo objetivo
+      by_result: {              # análisis por resultado del equipo
+        "G": { safe_by_pos, safe_by_coef, relegated, ascenso },
+        "E": { ... },
+        "D": { ... },
+      },
+      other_groups_coef: {      # análisis coeficiente otros grupos
+        gid: { nombre, scenarios_11th, min_coef, max_coef }
+      }
+    }
+    """
+    n_teams  = len(target_teams)
+    safe_pos = n_teams - DESCENSO_DIRECTO_N   # 11 para grupo de 14
+
+    flat = flatten_fixtures(target_fixtures)
+    target_match = find_target_match(flat, target_nombre)
+
+    # ── Enumerar escenarios de otros grupos (para coeficiente) ──────────────
+    other_coef: dict[str, dict] = {}
+    for gid, gdata in other_groups.items():
+        g_flat = flatten_fixtures(gdata["fixtures"])
+        g_scen = run_scenarios(gdata["teams"], g_flat)
+        items = []
+        for combo, final in g_scen:
+            if len(final) >= safe_pos:
+                t11 = final[safe_pos - 1]
+                items.append({
+                    "combo":  combo,
+                    "coef":   coef(t11["pts"], t11["pj"]),
+                    "pts":    t11["pts"],
+                    "pj":     t11["pj"],
+                    "nombre": t11["nombre"],
+                    "flat_matches": g_flat,
+                })
+        if items:
+            other_coef[gid] = {
+                "nombre":    gdata["nombre"],
+                "items":     items,
+                "min_coef":  min(x["coef"] for x in items),
+                "max_coef":  max(x["coef"] for x in items),
+                "flat_matches": g_flat,
+                "teams":     gdata["teams"],
+            }
+
+    # ── Analizar por resultado del equipo objetivo ──────────────────────────
+    results_map = {"G": "gana", "E": "empata", "D": "pierde"}
+    by_result: dict[str, dict] = {}
+
+    for target_result in ("G", "E", "D"):
+        # Construir dict inicial con el resultado del equipo ya aplicado
+        def make_base(tr=target_result):
+            d = {t["nombre"]: dict(t) for t in target_teams}
+            if target_match:
+                local, vis, _ = target_match
+                # Convertir resultado al punto de vista del local
+                if target_nombre.lower() in local.lower():
+                    r = tr
+                else:
+                    r = {"G": "D", "D": "G", "E": "E"}[tr]
+                apply_result(d, local, vis, r)
+            return d
+
+        # Partidos restantes SIN el del equipo objetivo
+        other_matches = [m for m in flat if m != target_match]
+        n_other = len(other_matches)
+
+        safe_pos_scenarios: list[dict] = []
+        coef_zone_scenarios: list[dict] = []
+        relegation_scenarios: list[dict] = []
+        ascenso_scenarios: list[dict] = []
+
+        for combo in product(("G", "E", "D"), repeat=n_other):
+            d = make_base()
+            match_outcomes: dict[tuple, str] = {}
+            for i, (local, vis, rnd) in enumerate(other_matches):
+                apply_result(d, local, vis, combo[i])
+                match_outcomes[(local, vis)] = combo[i]
+
+            final = sort_final(d)
+            target = team_data(final, target_nombre)
+            if not target:
+                continue
+            pos = target["pos"]
+
+            if pos <= ASCENSO_N:
+                ascenso_scenarios.append({
+                    "match_outcomes": match_outcomes,
+                    "final": final,
+                    "target": target,
+                    "position": pos,
+                })
+
+            if pos < safe_pos:
+                safe_pos_scenarios.append({
+                    "match_outcomes": match_outcomes,
+                    "final": final,
+                    "target": target,
+                    "position": pos,
+                })
+            elif pos == safe_pos:
+                my_c = coef(target["pts"], target["pj"])
+                # ¿Cuántos grupos pueden tener su undécimo con peor coef?
+                worse_info: dict[str, dict] = {}
+                for gid, gc_data in other_coef.items():
+                    worse_items = [x for x in gc_data["items"] if x["coef"] < my_c]
+                    worse_info[gid] = {
+                        "nombre":       gc_data["nombre"],
+                        "possible":     len(worse_items) > 0,
+                        "always_worse": gc_data["max_coef"] < my_c,
+                        "min_coef":     gc_data["min_coef"],
+                        "max_coef":     gc_data["max_coef"],
+                        "best_for_target": min(worse_items, key=lambda x: x["coef"])
+                                           if worse_items else None,
+                    }
+                n_possible_worse = sum(1 for v in worse_info.values() if v["possible"])
+
+                if n_possible_worse >= DESCENSO_COEF_N:
+                    coef_zone_scenarios.append({
+                        "match_outcomes": match_outcomes,
+                        "final": final,
+                        "target": target,
+                        "my_coef": my_c,
+                        "worse_info": worse_info,
+                        "n_possible_worse": n_possible_worse,
+                    })
+                else:
+                    relegation_scenarios.append({
+                        "match_outcomes": match_outcomes,
+                        "final": final,
+                        "target": target,
+                        "position": pos,
+                        "reason": "coef_imposible",
+                    })
+            else:
+                relegation_scenarios.append({
+                    "match_outcomes": match_outcomes,
+                    "final": final,
+                    "target": target,
+                    "position": pos,
+                    "reason": "descenso_directo",
+                })
+
+        by_result[target_result] = {
+            "label":      results_map[target_result],
+            "safe_pos":   safe_pos_scenarios,
+            "coef_zone":  coef_zone_scenarios,
+            "relegated":  relegation_scenarios,
+            "ascenso":    ascenso_scenarios,
+            "can_survive": len(safe_pos_scenarios) > 0 or len(coef_zone_scenarios) > 0,
+        }
+
     return {
-        "direct":           direct,
-        "eleventh_sorted":  eleventh,
-        "relegated_by_coef": eleventh[:DESCENSO_COEF_N],
-        "safe_by_coef":     eleventh[DESCENSO_COEF_N:],
+        "n_teams":      n_teams,
+        "safe_pos":     safe_pos,
+        "target_match": target_match,
+        "flat_matches": flat,
+        "by_result":    by_result,
+        "other_coef":   other_coef,
     }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SIMULACIÓN DE ESCENARIOS
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _position_range(
-    teams: list[dict],
-    target_nombre: str,
-    new_pts: int,
-    remaining: int,
-) -> tuple[int, int]:
-    others    = [t for t in teams if t["nombre"] != target_nombre]
-    best_pos  = sum(1 for t in others if t["pts"] > new_pts) + 1
-    worst_pos = sum(1 for t in others if t["pts"] + remaining * 3 >= new_pts) + 1
-    return best_pos, worst_pos
-
-
-def _scenario_status(best_pos: int, worst_pos: int, n_teams: int) -> tuple[str, str]:
-    safe_max = n_teams - DESCENSO_DIRECTO_N   # posición 11 para grupos de 14
-
-    best_label  = ("✅ SEGURO"     if best_pos  <= safe_max - 1 else
-                   "⚠ ZONA COEF"  if best_pos  == safe_max     else
-                   "❌ DESCENSO")
-    worst_label = ("✅ GARANTIZADO" if worst_pos <= safe_max - 1 else
-                   "⚠ ZONA COEF"   if worst_pos == safe_max     else
-                   "❌ DESCENSO POSIBLE")
-    return worst_label, best_label
-
-
-def simulate(
-    teams: list[dict],
-    target_nombre: str,
-    remaining: int,
-    all_standings: dict[str, list[dict]],
-    grupo_id: str,
-) -> None:
-    target = next(
-        (t for t in teams if target_nombre.lower() in t["nombre"].lower()), None
-    )
-    if not target:
-        print(f"\n  ❌ Equipo '{target_nombre}' no encontrado.")
-        print(f"     Equipos: {', '.join(t['nombre'] for t in teams)}")
-        return
-
-    n          = len(teams)
-    pos_actual = teams.index(target) + 1
-    safe_max   = n - DESCENSO_DIRECTO_N
-
-    print(f"\n{'═'*72}")
-    print(f"  SIMULACIÓN — {target['nombre'].upper()}")
-    print(f"{'═'*72}")
-    print(
-        f"  Posición: {pos_actual}/{n}  |  Pts: {target['pts']}  |  "
-        f"PJ: {target['pj']}  |  Coef: {coef(target['pts'], target['pj']):.3f}"
-    )
-    print(f"  Jornadas restantes: {remaining}")
-
-    # Undécimos de otros grupos (para zona coeficiente)
-    others_11th = [
-        {
-            "grupo":    gid,
-            "nombre":   gteams[10]["nombre"],
-            "pts":      gteams[10]["pts"],
-            "pj":       gteams[10]["pj"],
-            "coef_now": coef(gteams[10]["pts"], gteams[10]["pj"]),
-        }
-        for gid, gteams in all_standings.items()
-        if gid != grupo_id and len(gteams) >= 11
-    ]
-
-    scenarios = list(product(RESULT_PTS.keys(), repeat=remaining))
-    results   = []
-    for scenario in scenarios:
-        extra    = sum(RESULT_PTS[r] for r in scenario)
-        new_pts  = target["pts"] + extra
-        new_pj   = target["pj"] + remaining
-        new_coef = coef(new_pts, new_pj)
-
-        best_pos, worst_pos = _position_range(teams, target["nombre"], new_pts, remaining)
-        worst_label, best_label = _scenario_status(best_pos, worst_pos, n)
-
-        coef_rank = None
-        if others_11th:
-            coefs_worst = sorted(
-                o["coef_now"] + (3 * remaining / (o["pj"] + remaining))
-                if o["pj"] + remaining > 0 else 0.0
-                for o in others_11th
-            )
-            coef_rank = sum(1 for c in coefs_worst if c > new_coef) + 1
-
-        results.append({
-            "label":       "".join(scenario),
-            "extra":       extra,
-            "new_pts":     new_pts,
-            "new_pj":      new_pj,
-            "new_coef":    new_coef,
-            "best_pos":    best_pos,
-            "worst_pos":   worst_pos,
-            "worst_label": worst_label,
-            "best_label":  best_label,
-            "coef_rank":   coef_rank,
-        })
-
-    results.sort(key=lambda r: (-r["new_pts"], r["label"]))
-
-    guaranteed  = [r for r in results if r["worst_label"] == "✅ GARANTIZADO"]
-    coef_zone   = [r for r in results if "COEF" in r["worst_label"] or
-                   ("COEF" in r["best_label"] and "GARANTIZADO" not in r["worst_label"])]
-    conditional = [r for r in results if "DESCENSO" in r["worst_label"]
-                   and r["best_label"] == "✅ SEGURO"]
-    relegated   = [r for r in results if r["best_label"] == "❌ DESCENSO"]
-
-    def fmt_row(r: dict) -> str:
-        gs = r["label"].count("G")
-        es = r["label"].count("E")
-        ds = r["label"].count("D")
-        ci = f" | Rank undécimos: {r['coef_rank']}" if r["coef_rank"] else ""
-        return (
-            f"     {r['label']}  ({gs}V {es}E {ds}D)  → "
-            f"{r['new_pts']} pts | Coef: {r['new_coef']:.3f}"
-            f" | Pos: {r['best_pos']}–{r['worst_pos']}{ci}"
-        )
-
-    if guaranteed:
-        print(f"\n  ✅ PERMANENCIA GARANTIZADA (independiente de otros resultados):")
-        for r in guaranteed:
-            print(fmt_row(r))
-    if conditional:
-        print(f"\n  🔶 PERMANENCIA POSIBLE (depende de resultados de otros equipos):")
-        for r in conditional:
-            print(fmt_row(r))
-    if coef_zone:
-        print(f"\n  ⚠  ZONA COEFICIENTE (terminarían undécimos, compiten por coef):")
-        for r in coef_zone:
-            print(fmt_row(r))
-    if relegated:
-        print(f"\n  ❌ DESCENSO PROBABLE incluso en el mejor caso:")
-        for r in relegated:
-            print(fmt_row(r))
-
-    min_pts = min((r["new_pts"] for r in guaranteed), default=None)
-    if min_pts is not None:
-        print(f"\n  → Mínimo para GARANTIZAR permanencia: {min_pts - target['pts']} pts más "
-              f"(total {min_pts} pts)")
-    else:
-        print(f"\n  → No existe resultado que garantice permanencia matemáticamente.")
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# SALIDA POR PANTALLA
+# SALIDA
 # ══════════════════════════════════════════════════════════════════════════════
 
 def print_standings_table(
     teams: list[dict],
     titulo: str,
     highlight: str = "",
+    n_teams: Optional[int] = None,
 ) -> None:
-    n        = len(teams)
+    n        = n_teams or len(teams)
     safe_max = n - DESCENSO_DIRECTO_N
 
     print(f"\n{'═'*75}")
@@ -379,7 +479,6 @@ def print_standings_table(
         f"{'GF':>4} {'GC':>4} {'DG':>5} {'Pts':>4} {'Coef':>6}"
     )
     print(f"{'─'*75}")
-
     for i, t in enumerate(teams):
         pos  = i + 1
         c    = coef(t["pts"], t["pj"])
@@ -391,38 +490,322 @@ def print_standings_table(
             f"{t['gf']:>4} {t['gc']:>4} {t['dg']:>+5} {t['pts']:>4} "
             f"{c:>6.3f}{mark}"
         )
-
     print(f"{'─'*75}")
-    print(f"  ↓ Descenso directo  ? Zona coeficiente (11ºs, comparan coef entre grupos)")
+    print(f"  ↓ Descenso directo  ? Zona coeficiente")
 
 
 def print_relegation_analysis(analysis: dict, n_grupos: int) -> None:
+    direct    = analysis["direct"]
+    eleventh  = analysis["eleventh_sorted"]
     print(f"\n{'═'*75}")
-    print(f"  ANÁLISIS DE DESCENSO — {n_grupos} grupo(s) descargado(s)")
+    print(f"  ANÁLISIS DE DESCENSO — {n_grupos} grupo(s)")
     print(f"{'═'*75}")
-
-    if analysis["direct"]:
+    if direct:
         print(f"\n  📉 DESCENSO DIRECTO (últimas {DESCENSO_DIRECTO_N} posiciones):")
-        for t in analysis["direct"]:
-            c = coef(t["pts"], t["pj"])
+        for t in direct:
             print(
                 f"     [{t['grupo'][-6:]}] {t['nombre']:<32} "
-                f"Pts:{t['pts']:>3}  PJ:{t['pj']:>2}  Coef:{c:.3f}"
+                f"Pts:{t['pts']:>3}  PJ:{t['pj']:>2}  Coef:{coef(t['pts'], t['pj']):.3f}"
             )
-
-    if analysis["eleventh_sorted"]:
-        print(
-            f"\n  ⚠  ZONA COEFICIENTE — undécimos "
-            f"(descienden los {DESCENSO_COEF_N} con peor coef):"
-        )
-        for i, t in enumerate(analysis["eleventh_sorted"]):
+    if eleventh:
+        print(f"\n  ⚠  ZONA COEFICIENTE — undécimos (descienden los {DESCENSO_COEF_N} peores):")
+        for i, t in enumerate(eleventh):
             estado = "↓ DESCIENDE" if i < DESCENSO_COEF_N else "✅ PERMANECE"
             print(
                 f"     {estado}  [{t['grupo'][-6:]}] {t['nombre']:<28} "
                 f"Coef:{t['coef']:.3f}  (Pts:{t['pts']:>3}  PJ:{t['pj']:>2})"
             )
     elif n_grupos == 1:
-        print(f"\n  ℹ  Para análisis completo de coeficiente usa --todos-grupos")
+        print(f"\n  ℹ  Para análisis de coeficiente usa --todos-grupos")
+
+
+def _fmt_match_outcome(local: str, vis: str, result: str) -> str:
+    short_local = local.split()[0] if len(local) > 20 else local
+    short_vis   = vis.split()[0]   if len(vis) > 20   else vis
+    lbl = {"G": f"gana {short_local}", "E": f"empatan", "D": f"gana {short_vis}"}
+    return lbl[result]
+
+
+def _fmt_condition(local: str, vis: str, allowed: set) -> str:
+    """Formatea una condición mínima como texto legible."""
+    sl = local.split()[0] if len(local) > 20 else local
+    sv = vis.split()[0] if len(vis) > 20 else vis
+    if allowed == {"G"}:
+        return f"gana {sl}"
+    if allowed == {"D"}:
+        return f"gana {sv}"
+    if allowed == {"E"}:
+        return f"empate {sl}–{sv}"
+    if allowed == {"G", "E"}:
+        return f"{sv} no gana (gana o empata {sl})"
+    if allowed == {"E", "D"}:
+        return f"{sl} no gana (gana o empata {sv})"
+    if allowed == {"G", "D"}:
+        return f"no empate ({sl} o {sv} ganan)"
+    return "cualquier resultado"
+
+
+def print_survival_report(
+    target_nombre: str,
+    analysis: dict,
+    groups_meta: dict,
+    all_standings: dict,
+) -> None:
+    """Imprime el análisis de permanencia/ascenso."""
+    safe_pos   = analysis["safe_pos"]
+    by_result  = analysis["by_result"]
+    other_coef = analysis["other_coef"]
+    flat       = analysis["flat_matches"]
+    n_teams    = analysis["n_teams"]
+
+    target_match = analysis["target_match"]
+
+    print(f"\n{'═'*75}")
+    print(f"  ANÁLISIS DE PERMANENCIA — {target_nombre.upper()}")
+    print(f"{'═'*75}")
+
+    if not flat:
+        print("  ℹ  No quedan jornadas por disputar.")
+        return
+
+    # Partidos restantes del grupo
+    print(f"\n  Partidos pendientes:")
+    for local, vis, rnd in flat:
+        is_target = (
+            target_nombre.lower() in local.lower() or
+            target_nombre.lower() in vis.lower()
+        )
+        mark = " ◄ (PARTIDO DEL EQUIPO)" if is_target else ""
+        print(f"    J{rnd}: {local} vs {vis}{mark}")
+
+    # ── Tabla de coeficientes undécimos (todos los grupos) ──────────────────
+    if other_coef:
+        print(f"\n  {'─'*73}")
+        print(f"  UNDÉCIMOS ACTUALES (zona coeficiente — {DESCENSO_COEF_N} peores descienden):")
+        print(f"  {'─'*73}")
+        print(f"  {'Grupo':<10} {'Equipo':<36} {'Pts':>3} {'PJ':>3} {'Coef':>6}  {'Rango posible':>20}")
+        print(f"  {'─'*73}")
+        for gid, gc_data in sorted(other_coef.items()):
+            t_curr = all_standings.get(gid, [])
+            t11 = t_curr[safe_pos - 1] if len(t_curr) >= safe_pos else None
+            if not t11:
+                continue
+            c_curr = coef(t11["pts"], t11["pj"])
+            c_min  = gc_data["min_coef"]
+            c_max  = gc_data["max_coef"]
+            print(
+                f"  {gc_data['nombre']:<10} {t11['nombre']:<36} "
+                f"{t11['pts']:>3} {t11['pj']:>3} {c_curr:>6.3f}  "
+                f"[{c_min:.3f} – {c_max:.3f}]"
+            )
+        # Equipo objetivo (su grupo no está en other_coef)
+        print(f"  {'─'*73}")
+
+    # ── Análisis por resultado del equipo ───────────────────────────────────
+    results_label = {"G": "GANA", "E": "EMPATA", "D": "PIERDE"}
+    results_emoji = {"G": "⚽", "E": "🤝", "D": "❌"}
+
+    can_survive_at_all = any(r["can_survive"] for r in by_result.values())
+
+    for tr in ("G", "E", "D"):
+        rdata = by_result[tr]
+        n_safe_pos  = len(rdata["safe_pos"])
+        n_coef      = len(rdata["coef_zone"])
+        n_rel       = len(rdata["relegated"])
+        n_asc       = len(rdata["ascenso"])
+        total       = n_safe_pos + n_coef + n_rel
+
+        print(f"\n  {'─'*73}")
+        print(f"  {results_emoji[tr]} SI {target_nombre.split()[0].upper()} "
+              f"{results_label[tr]}:")
+
+        if not rdata["can_survive"]:
+            print(f"     → DESCENSO DIRECTO en todos los escenarios ({total} combinaciones) ❌")
+            continue
+
+        if n_asc:
+            print(f"     ✅ Ascenso posible en {n_asc}/{total} escenarios")
+
+        if n_safe_pos:
+            print(f"     ✅ Permanencia por posición (≤{safe_pos-1}º) en "
+                  f"{n_safe_pos}/{total} escenarios")
+            # Mostrar el mejor escenario (el que requiere menos condiciones favorables)
+            best = min(rdata["safe_pos"], key=lambda s: s["position"])
+            pos_final = best["position"]
+            print(f"        Mejor caso → posición {pos_final}ª")
+            # Mostrar qué resultados del grupo se necesitan
+            conds = []
+            for (local, vis), result in best["match_outcomes"].items():
+                conds.append(f"{_fmt_match_outcome(local, vis, result)}")
+            if conds:
+                print(f"        Condiciones en el grupo:")
+                for c_txt in conds:
+                    print(f"          • {c_txt}")
+
+        if n_coef:
+            print(f"     ⚠  Permanencia posible por coeficiente en "
+                  f"{n_coef}/{total} escenarios")
+            best_coef = max(rdata["coef_zone"], key=lambda s: s["n_possible_worse"])
+            my_c = best_coef["my_coef"]
+            wi   = best_coef["worse_info"]
+
+            print(f"        Coeficiente de {target_nombre.split()[0]}: {my_c:.3f}")
+            other_matches_in_group = [m for m in flat if m != target_match]
+            min_conds = find_minimum_conditions(rdata["coef_zone"], other_matches_in_group)
+            if min_conds:
+                print(f"        Condición(es) necesaria(s) en el grupo:")
+                for (local, vis), allowed in min_conds.items():
+                    print(f"          • {_fmt_condition(local, vis, allowed)}")
+            else:
+                print(f"        Sin condiciones adicionales en el grupo.")
+
+            always_worse = [v for v in wi.values() if v["always_worse"]]
+            possibly_worse = [v for v in wi.values() if v["possible"] and not v["always_worse"]]
+            always_better  = [v for v in wi.values() if not v["possible"]]
+
+            if always_worse:
+                names = ", ".join(f"{v['nombre']}({v['min_coef']:.3f})"
+                                  for v in always_worse)
+                print(f"        ✅ Grupos con undécimo SIEMPRE peor (sin condiciones): {names}")
+
+            if possibly_worse:
+                print(f"        🎯 Grupos que necesitan tener su undécimo peor que {my_c:.3f}:")
+                for v in possibly_worse:
+                    s = v["best_for_target"]
+                    if s:
+                        # Describir los resultados necesarios en ese grupo
+                        cond_parts = []
+                        for i, (local, vis, _) in enumerate(s["flat_matches"]):
+                            cond_parts.append(_fmt_match_outcome(local, vis, s["combo"][i]))
+                        cond_str = " | ".join(cond_parts)
+                        print(
+                            f"          • {v['nombre']}: undécimo debe quedar "
+                            f"≤ {s['coef']:.3f} pts ({s['pts']} pts / {s['pj']} PJ)"
+                        )
+                        if cond_str:
+                            print(f"            → {cond_str}")
+
+            if always_better:
+                names = ", ".join(f"{v['nombre']}({v['min_coef']:.3f})"
+                                  for v in always_better)
+                print(f"        ❌ Grupos con undécimo SIEMPRE mejor (desfavorables): {names}")
+
+            n_against = len(always_better)
+            n_needed  = DESCENSO_COEF_N - len(always_worse) - len(possibly_worse)
+            if n_against > (7 - DESCENSO_COEF_N):
+                print(f"        ⛔ Demasiados grupos con coef superior → coef muy difícil")
+            else:
+                print(f"        → Con las condiciones anteriores: ✅ PERMANENCIA POR COEF")
+
+    # ── Resumen narrativo ───────────────────────────────────────────────────
+    print(f"\n{'═'*75}")
+    print(f"  💬 RESUMEN")
+    print(f"{'═'*75}")
+
+    if not can_survive_at_all:
+        print(f"\n  ❌ NO existe ningún escenario de permanencia.")
+        print(f"     El descenso de {target_nombre} es matemáticamente seguro.")
+        return
+
+    # Encontrar el resultado mínimo para sobrevivir
+    min_result_needed = None
+    for tr in ("D", "E", "G"):  # orden: del peor al mejor resultado
+        if by_result[tr]["can_survive"]:
+            min_result_needed = tr
+
+    result_texts = {"G": "GANA", "E": "EMPATA", "D": "PIERDE"}
+    print(f"\n  🟡 EXISTE UN CAMINO A LA PERMANENCIA.")
+
+    if target_match:
+        local, vis, rnd = target_match
+        is_local = target_nombre.lower() in local.lower()
+        rival = vis if is_local else local
+        cond_loc = "LOCAL" if is_local else "VISITANTE"
+        print(f"\n  Partido clave: J{rnd} — {local} vs {vis}")
+
+    rdata = by_result[min_result_needed]
+
+    # ¿Puede sobrevivir por posición?
+    if rdata["safe_pos"]:
+        best = min(rdata["safe_pos"], key=lambda s: s["position"])
+        print(f"\n  ✅ MEJOR CAMINO — Permanencia POR POSICIÓN:")
+        print(f"     1. {target_nombre.split()[0]} debe {result_texts[min_result_needed].lower()} "
+              f"su partido")
+        if best["match_outcomes"]:
+            print(f"     2. En el resto del grupo:")
+            for (local, vis), result in best["match_outcomes"].items():
+                print(f"        • {_fmt_match_outcome(local, vis, result)}")
+        print(f"     → {target_nombre.split()[0]} terminaría en posición "
+              f"{best['position']}ª ✅")
+
+    # ¿Puede sobrevivir por coeficiente?
+    if rdata["coef_zone"]:
+        best_coef = max(rdata["coef_zone"], key=lambda s: s["n_possible_worse"])
+        my_c = best_coef["my_coef"]
+        wi   = best_coef["worse_info"]
+        always_w = [v for v in wi.values() if v["always_worse"]]
+        possibly_w = [v for v in wi.values() if v["possible"] and not v["always_worse"]]
+        always_b   = [v for v in wi.values() if not v["possible"]]
+
+        print(f"\n  ⚠️  CAMINO ALTERNATIVO — Permanencia POR COEFICIENTE:")
+        print(f"     1. {target_nombre.split()[0]} debe {result_texts[min_result_needed].lower()} "
+              f"→ coef: {my_c:.3f}")
+        if best_coef["match_outcomes"]:
+            print(f"     2. En el resto del grupo:")
+            for (local, vis), result in best_coef["match_outcomes"].items():
+                print(f"        • {_fmt_match_outcome(local, vis, result)}")
+
+        if always_w:
+            print(f"     3. Grupos ya asegurados (undécimo siempre peor):")
+            for v in always_w:
+                print(f"        • {v['nombre']} ({v['min_coef']:.3f}–{v['max_coef']:.3f}) ✅")
+
+        if possibly_w:
+            print(f"     4. Condiciones necesarias en otros grupos:")
+            for v in possibly_w:
+                s = v["best_for_target"]
+                if s:
+                    cond_parts = []
+                    for i, (l2, v2, _) in enumerate(s["flat_matches"]):
+                        cond_parts.append(_fmt_match_outcome(l2, v2, s["combo"][i]))
+                    print(f"        • {v['nombre']}: {' | '.join(cond_parts)}")
+                    print(f"          → undécimo quedaría con coef {s['coef']:.3f} < {my_c:.3f}")
+
+        if always_b:
+            print(f"     ❌ Grupos siempre mejores (inamovibles):")
+            for v in always_b:
+                print(f"        • {v['nombre']} (min coef {v['min_coef']:.3f})")
+
+        n_needed = DESCENSO_COEF_N - len(always_w) - len(possibly_w)
+        if n_needed > 0:
+            print(f"     ⚠️  Faltan {n_needed} grupo(s) adicionales para completar los "
+                  f"{DESCENSO_COEF_N} peores → coef muy difícil")
+        else:
+            print(f"     → Con las condiciones anteriores: ✅ PERMANENCIA POR COEF POSIBLE")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ANÁLISIS DE DESCENSO (clasificación actual)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def build_relegation_analysis(all_standings: dict[str, list[dict]]) -> dict:
+    direct: list[dict] = []
+    eleventh: list[dict] = []
+    for gid, teams in all_standings.items():
+        n = len(teams)
+        for t in teams[n - DESCENSO_DIRECTO_N:]:
+            direct.append({**t, "grupo": gid})
+        if n >= 11:
+            t11 = teams[10]
+            eleventh.append({**t11, "grupo": gid,
+                              "coef": coef(t11["pts"], t11["pj"])})
+    eleventh.sort(key=lambda x: x["coef"])
+    return {
+        "direct":            direct,
+        "eleventh_sorted":   eleventh,
+        "relegated_by_coef": eleventh[:DESCENSO_COEF_N],
+        "safe_by_coef":      eleventh[DESCENSO_COEF_N:],
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -482,24 +865,21 @@ def save_cache(path: Path, data: dict) -> None:
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description=(
-            "Clasificaciones RFFM — Preferente Alevín F11\n"
-            "Descarga clasificación, analiza descenso y simula escenarios.\n\n"
+            "Clasificaciones RFFM — Preferente Alevín F11\n\n"
             "Ejemplos:\n"
-            "  python rffm_clasificacion.py --todos-grupos -e Ivero\n"
-            "  python rffm_clasificacion.py --todos-grupos -e Ivero --cache\n"
+            "  python rffm_clasificacion.py -e Ivero\n"
+            "  python rffm_clasificacion.py -e Ivero --cache\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("--equipo", "-e", default="",
-        help="Nombre (parcial) del equipo a simular.")
+        help="Nombre (parcial) del equipo a analizar.")
     p.add_argument("--grupo", "-g", default=GRUPO_7_ID,
-        help=f"ID del grupo a mostrar (default: {GRUPO_7_ID} = Grupo 7).")
+        help=f"ID del grupo principal (default: {GRUPO_7_ID} = Grupo 7).")
     p.add_argument("--competicion", "-c", default=COMPETICION_DEFAULT,
         help=f"ID de la competición (default: {COMPETICION_DEFAULT}).")
     p.add_argument("--total-jornadas", "-j", type=int, default=0,
         help="Total de jornadas (0 = usar el valor de la API).")
-    p.add_argument("--todos-grupos", action="store_true",
-        help="Descarga los 8 grupos (necesario para análisis de coef. cruzado).")
     p.add_argument("--cache", action="store_true",
         help="Usa clasificacion_cache.json si existe.")
     p.add_argument("--borrar-cache", action="store_true",
@@ -520,12 +900,13 @@ def main() -> None:
         print("🗑  Caché eliminada.")
 
     print("═" * 75)
-    print("  RFFM · Preferente Alevín Fútbol 11 · Análisis de Descenso")
+    print("  RFFM · Preferente Alevín Fútbol 11 · Análisis de Clasificación")
     print("═" * 75)
 
     session      = make_session()
     all_standings: dict[str, list[dict]] = {}
     groups_meta:   dict[str, dict]       = {}
+    all_fixtures:  dict[str, dict]       = {}   # gid → {jornada: [partidos]}
 
     # ── Caché ────────────────────────────────────────────────────────────────
     if args.cache:
@@ -533,62 +914,72 @@ def main() -> None:
         if cached:
             all_standings = cached.get("standings", {})
             groups_meta   = cached.get("groups_meta", {})
-            jornada_cache = groups_meta.get(args.grupo, {}).get("jornada_actual", "?")
-            print(f"\n📂 Datos cargados desde caché (Jornada {jornada_cache})")
+            all_fixtures  = cached.get("fixtures", {})
+            j_cache = groups_meta.get(args.grupo, {}).get("jornada_actual", "?")
+            print(f"\n📂 Datos cargados desde caché (Jornada {j_cache})")
 
     # ── Descarga online ───────────────────────────────────────────────────────
     if not all_standings:
-        if args.todos_grupos:
-            print(f"\n🔍 Obteniendo grupos de la competición...")
-            groups = discover_groups(session, args.competicion)
-            if not groups:
-                print("❌ No se pudieron obtener los grupos.")
-                sys.exit(1)
-            if not any(g["id"] == args.grupo for g in groups):
-                groups.append({"id": args.grupo, "nombre": "Grupo 7",
-                                "total_jornadas": 26, "total_equipos": 14})
-            print(f"  Grupos a descargar: {len(groups)}")
-        else:
-            groups = [{"id": args.grupo, "nombre": "Grupo objetivo",
-                       "total_jornadas": args.total_jornadas or 26,
-                       "total_equipos": 14}]
+        print(f"\n🔍 Obteniendo grupos...")
+        groups = discover_groups(session, args.competicion)
+        if not groups:
+            print("❌ No se pudieron obtener los grupos.")
+            sys.exit(1)
+        if not any(g["id"] == args.grupo for g in groups):
+            groups.append({"id": args.grupo, "nombre": "Grupo 7",
+                           "total_jornadas": 26, "total_equipos": 14})
 
-        print(f"\n📊 Descargando clasificaciones...")
+        print(f"  Grupos: {len(groups)}")
+        print(f"\n📊 Descargando clasificaciones y partidos pendientes...")
+
         for g in groups:
             gid = g["id"]
             print(f"  · {g['nombre']} ({gid}) ...", end=" ", flush=True)
 
             jornada_actual = discover_current_round(session, gid)
             data  = fetch_json(session, "/api/standings", {
-                "idGroup": gid,
-                "round":   jornada_actual,
+                "idGroup": gid, "round": jornada_actual,
             })
             teams = parse_standings(data)
+
+            total_j = (args.total_jornadas if args.total_jornadas and gid == args.grupo
+                       else g["total_jornadas"])
+
+            fixtures = get_remaining_fixtures(session, gid, jornada_actual, total_j)
 
             if teams:
                 all_standings[gid] = teams
                 groups_meta[gid]   = {
-                    "nombre":          g["nombre"],
-                    "total_jornadas":  (args.total_jornadas
-                                        if args.total_jornadas and gid == args.grupo
-                                        else g["total_jornadas"]),
-                    "total_equipos":   g["total_equipos"],
-                    "jornada_actual":  jornada_actual,
+                    "nombre":         g["nombre"],
+                    "total_jornadas": total_j,
+                    "total_equipos":  g["total_equipos"],
+                    "jornada_actual": jornada_actual,
                 }
-                print(f"✓ {len(teams)} equipos (J{jornada_actual})")
+                all_fixtures[gid] = {str(k): v for k, v in fixtures.items()}
+                jornadas_pending = sorted(fixtures.keys())
+                if not jornadas_pending:
+                    j_info = "competición finalizada"
+                elif len(jornadas_pending) == 1:
+                    j_info = f"1 jornada restante: J{jornadas_pending[0]}"
+                else:
+                    j_info = (f"{len(jornadas_pending)} jornadas restantes: "
+                              f"J{jornadas_pending[0]}–J{jornadas_pending[-1]}")
+                print(f"✓ {len(teams)} eq (J{jornada_actual}, {j_info})")
             else:
                 print("✗ sin datos")
 
-            time.sleep(0.3)
-
-        save_cache(cache_file, {"standings": all_standings, "groups_meta": groups_meta})
+        save_cache(cache_file, {
+            "standings": all_standings,
+            "groups_meta": groups_meta,
+            "fixtures": all_fixtures,
+        })
         print(f"\n💾 Datos guardados en {cache_file}")
 
     if not all_standings:
         print("\n❌ No se pudieron obtener datos.")
         sys.exit(1)
 
-    # ── Localizar equipo y su grupo ───────────────────────────────────────────
+    # ── Localizar equipo ─────────────────────────────────────────────────────
     equipo_nombre   = args.equipo
     grupo_id_equipo = args.grupo
 
@@ -601,44 +992,62 @@ def main() -> None:
                 print(f"\n  🔎 '{equipo_nombre}' encontrado en grupo {found_gid}")
         else:
             print(f"\n  ⚠ No se encontró '{equipo_nombre}'.")
-            if not args.todos_grupos:
-                print("     Prueba con --todos-grupos para buscar en los 8 grupos.")
-
-    # ── Jornadas restantes ────────────────────────────────────────────────────
-    meta           = groups_meta.get(grupo_id_equipo, {})
-    total_jornadas = (args.total_jornadas if args.total_jornadas
-                      else meta.get("total_jornadas", 26))
-    jornada_actual = meta.get("jornada_actual", 1)
-    remaining      = max(0, total_jornadas - jornada_actual)
 
     # ── Clasificación del grupo objetivo ─────────────────────────────────────
-    grupo_teams          = all_standings.get(grupo_id_equipo, [])
-    grupo_nombre_display = meta.get("nombre", f"Grupo {grupo_id_equipo}")
+    meta          = groups_meta.get(grupo_id_equipo, {})
+    total_jornadas = meta.get("total_jornadas", 26)
+    jornada_actual = meta.get("jornada_actual", 1)
+    remaining      = max(0, total_jornadas - jornada_actual)
+    grupo_teams    = all_standings.get(grupo_id_equipo, [])
+    grupo_nombre   = meta.get("nombre", f"Grupo {grupo_id_equipo}")
 
     if grupo_teams:
         print_standings_table(
             grupo_teams,
-            f"CLASIFICACIÓN {grupo_nombre_display.upper()} — PREFERENTE ALEVÍN "
+            f"CLASIFICACIÓN {grupo_nombre.upper()} — PREFERENTE ALEVÍN "
             f"— Jornada {jornada_actual} ({remaining} jornada(s) restante(s))",
             highlight=equipo_nombre,
         )
-    else:
-        print(f"\n  ⚠ No hay datos para el grupo {grupo_id_equipo}")
 
-    # ── Análisis de descenso ──────────────────────────────────────────────────
-    analysis = build_relegation_analysis(all_standings)
-    print_relegation_analysis(analysis, len(all_standings))
+    # ── Análisis de descenso actual ───────────────────────────────────────────
+    rel_analysis = build_relegation_analysis(all_standings)
+    print_relegation_analysis(rel_analysis, len(all_standings))
 
-    # ── Simulación ────────────────────────────────────────────────────────────
-    if equipo_nombre and grupo_teams and remaining > 0:
-        simulate(grupo_teams, equipo_nombre, remaining, all_standings, grupo_id_equipo)
-    elif equipo_nombre and remaining == 0:
-        print(f"\n  ℹ La competición ha finalizado. No quedan jornadas.")
-    elif not equipo_nombre:
-        print(
-            f"\n  ℹ Usa --equipo \"Nombre\" para simular escenarios. "
-            f"Con --todos-grupos busca en todos los grupos."
+    # ── Análisis de permanencia/ascenso ──────────────────────────────────────
+    if equipo_nombre and remaining > 0:
+        target_fixtures_raw = all_fixtures.get(grupo_id_equipo, {})
+        target_fixtures = {int(k): v for k, v in target_fixtures_raw.items()}
+
+        other_groups: dict[str, dict] = {}
+        for gid, teams in all_standings.items():
+            if gid == grupo_id_equipo:
+                continue
+            gfix_raw = all_fixtures.get(gid, {})
+            gfix     = {int(k): v for k, v in gfix_raw.items()}
+            other_groups[gid] = {
+                "nombre":   groups_meta.get(gid, {}).get("nombre", gid),
+                "teams":    teams,
+                "fixtures": gfix,
+            }
+
+        print(f"\n  ⚙  Calculando simulación ({3**sum(len(v) for v in target_fixtures.values())} "
+              f"escenarios en grupo + {len(other_groups)} grupos adicionales)...")
+
+        survival = analyze_survival(
+            equipo_nombre,
+            grupo_teams,
+            target_fixtures,
+            other_groups,
         )
+
+        print_survival_report(
+            equipo_nombre, survival, groups_meta, all_standings
+        )
+
+    elif equipo_nombre and remaining == 0:
+        print(f"\n  ℹ La competición ha finalizado.")
+    elif not equipo_nombre:
+        print(f"\n  ℹ Usa --equipo \"Nombre\" para analizar escenarios.")
 
 
 if __name__ == "__main__":
